@@ -1,74 +1,75 @@
 # Face Detection & Recognition App
 
-Real-time webcam app that detects faces and identifies them against a personal whitelist,
-with an optional fallback to AWS Rekognition for celebrity recognition.
+Real-time webcam app that detects faces and checks them against a personal whitelist.
+**No cmake, no build tools — installs with plain `pip` on Windows, macOS, and Linux.**
 
-## Color key
+## Box colour key
 
-| Box color | Meaning |
-|---|---|
+| Colour | Meaning |
+|--------|---------|
 | **Green** | Whitelist match (≥ 80% similarity) — shows name and score |
-| **Yellow** | Celebrity identified via AWS Rekognition (≥ 80% confidence) — shows ★ name and score |
 | **Red** | No match |
 
 ---
 
-## Quick start
+## Quick start (Windows)
 
-### 1. Install system dependencies (required for dlib)
+### 1. Create and activate a virtual environment
 
-**Ubuntu / Debian:**
-```bash
-sudo apt-get update
-sudo apt-get install -y cmake build-essential libopenblas-dev liblapack-dev
-```
-
-**macOS (Homebrew):**
-```bash
-brew install cmake
-```
-
-### 2. Install Python dependencies
-
-```bash
+```bat
 python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
+venv\Scripts\activate
+```
+
+### 2. Install dependencies
+
+```bat
 pip install -r requirements.txt
 ```
 
-Verify:
-```bash
-python -c "import face_recognition, cv2, boto3; print('All imports OK')"
+> **Note:** On the very first run `deepface` downloads the Facenet512 model weights
+> (~92 MB). This is a one-time download; subsequent runs are instant.
+
+Verify the installation:
+
+```bat
+python -c "import deepface, cv2; print('All imports OK')"
 ```
 
 ### 3. Add people to the whitelist
 
-**Option A — one image per person (flat):**
+Place one or more clear, front-facing photos in the `whitelist/` folder.
+
+**Option A — one image per person (simplest):**
+
 ```
 whitelist/
 ├── alice.jpg
 └── bob.png
 ```
 
-**Option B — multiple images per person (more robust):**
+The filename stem (`alice`, `bob`) becomes the display name shown on screen.
+
+**Option B — multiple images per person (more accurate):**
+
 ```
 whitelist/
 ├── alice/
 │   ├── front.jpg
 │   └── angle.jpg
 └── bob/
-    └── photo.jpg
+    └── passport.jpg
 ```
 
-Rules:
-- The filename stem (Option A) or directory name (Option B) becomes the display name.
-- Each image should contain exactly one clear, front-facing face.
-- Supported formats: `.jpg`, `.jpeg`, `.png`
-- Restart `app.py` after adding images — the whitelist is loaded once at startup.
+Rules for reference images:
+- Exactly **one** clearly visible face per image.
+- Good lighting, front-facing — passport-style photos work best.
+- Supported formats: `.jpg`, `.jpeg`, `.png`, `.bmp`
+- Restart `app.py` after adding or changing images (whitelist loads at startup).
 
 ### 4. Run
 
-```bash
+```bat
 python app.py
 ```
 
@@ -76,31 +77,16 @@ Press **`q`** to quit.
 
 ---
 
-## AWS Rekognition setup (optional)
+## macOS / Linux
 
-When a face doesn't match your whitelist, the app can query AWS Rekognition's
-`RecognizeCelebrities` API to identify public figures.
+Same steps — no system packages required.
 
-### Configure credentials (choose one method)
-
-**Environment variables:**
 ```bash
-export AWS_ACCESS_KEY_ID=your_key
-export AWS_SECRET_ACCESS_KEY=your_secret
-export AWS_DEFAULT_REGION=us-east-1
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+python app.py
 ```
-
-**AWS credentials file (`~/.aws/credentials`):**
-```ini
-[default]
-aws_access_key_id = your_key
-aws_secret_access_key = your_secret
-region = us-east-1
-```
-
-If credentials are not configured, the app runs normally — unknown faces just show "No Match".
-
-**Free tier:** AWS offers 5,000 Rekognition image analyses per month for the first 12 months.
 
 ---
 
@@ -109,27 +95,24 @@ If credentials are not configured, the app runs normally — unknown faces just 
 Edit the constants at the top of `app.py`:
 
 | Constant | Default | Description |
-|---|---|---|
-| `SIMILARITY_THRESHOLD` | `0.80` | Minimum score (0–1) for a whitelist match to count |
-| `CELEBRITY_THRESHOLD` | `0.80` | Minimum AWS confidence (0–1) to show a celebrity name |
-| `SCALE_FACTOR` | `0.5` | Resize factor for detection (lower = faster but less accurate) |
-| `REKOGNITION_COOLDOWN` | `1.0` | Minimum seconds between AWS API calls |
+|----------|---------|-------------|
+| `SIMILARITY_THRESHOLD` | `80.0` | Minimum score (%) for a match |
+| `PROCESS_EVERY_N` | `3` | Run recognition every N frames (higher = faster but less responsive) |
+| `MIN_FACE_SIZE` | `(80, 80)` | Minimum face size in pixels to detect |
+| `MODEL_NAME` | `"Facenet512"` | DeepFace model — see [available models](https://github.com/serengil/deepface#face-recognition-models) |
 
 ---
 
 ## Troubleshooting
 
-**`dlib` build fails:**
-Make sure `cmake` and `build-essential` are installed before running `pip install`.
+**Camera not found:**
+Edit `cv2.VideoCapture(0)` in `app.py` — try index `1`, `2`, etc.
 
 **Low FPS:**
-Lower `SCALE_FACTOR` (e.g. `0.25`) or reduce your camera resolution.
+Increase `PROCESS_EVERY_N` (e.g. `5`) or reduce camera resolution in `app.py`.
 
-**False negatives (known person not recognised):**
-Add more reference images with varied angles and lighting conditions.
+**Known person not recognised:**
+Add more reference photos with varied angles and lighting. Ensure the whitelist image has exactly one face.
 
-**Camera not found:**
-Check that a webcam is connected. Edit `cv2.VideoCapture(0)` in `app.py` to try a different index (1, 2, ...).
-
-**AWS credentials error:**
-Run `aws sts get-caller-identity` to verify your credentials are configured correctly.
+**`No module named 'deepface'`:**
+Make sure your virtual environment is activated before running `pip install` and `python app.py`.

@@ -1,256 +1,234 @@
 """
-app.py — Real-time face detection and recognition
+app.py — Real-time face detection and recognition (Windows-compatible)
 
-- Green box  : Whitelist match (≥80% similarity)
-- Yellow box : Celebrity identified via AWS Rekognition (≥80% confidence)
-- Red box    : No match
+On first run, DeepFace downloads model weights (~92 MB). Subsequent runs are instant.
+
+Box colours:
+  Green  — whitelist match (≥ 80% similarity) — shows name and score
+  Red    — no match
 
 Whitelist setup:
-  Flat:        whitelist/<name>.jpg
-  Subdirectory: whitelist/<name>/photo1.jpg  (multiple images = better accuracy)
-
-AWS Rekognition (optional):
-  Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION
-  or configure ~/.aws/credentials
-  If not configured, unknown faces show "No Match" instead.
+  Flat layout   :  whitelist/<name>.jpg   (one image per person)
+  Subdirectory  :  whitelist/<name>/photo1.jpg  (multiple images = better accuracy)
 
 Press 'q' to quit.
 """
 
-import time
+import os
 import cv2
 import numpy as np
-import face_recognition
 from pathlib import Path
 from collections import defaultdict
+from deepface import DeepFace
 
-# ── Configuration ────────────────────────────────────────────────────────────
+# ── Configuration ─────────────────────────────────────────────────────────────
 WHITELIST_DIR        = "whitelist"
-SIMILARITY_THRESHOLD = 0.80   # 0–1: minimum score for whitelist match
-CELEBRITY_THRESHOLD  = 0.80   # 0–1: minimum confidence for celebrity match
-SCALE_FACTOR         = 0.5    # downscale factor for detection speed
-DISTANCE_SCALE       = 0.6    # face_recognition distance that maps to 0% similarity
-REKOGNITION_COOLDOWN = 1.0    # seconds between AWS API calls
-CACHE_SNAP           = 20     # round bbox coords to this many px for cache key
+MODEL_NAME           = "Facenet512"   # downloads ~92 MB on first run; cached afterwards
+DETECTOR_BACKEND     = "opencv"       # fast, ships with opencv-python — no extras needed
+SIMILARITY_THRESHOLD = 80.0           # percent — faces scoring ≥ this count as a match
+PROCESS_EVERY_N      = 3              # run recognition on every Nth frame (boosts FPS)
+MIN_FACE_SIZE        = (80, 80)       # ignore detections smaller than this (px)
 
-# BGR colors
-COLOR_MATCH     = (0, 255, 0)    # green  — whitelist match
-COLOR_CELEBRITY = (0, 215, 255)  # yellow — celebrity
-COLOR_NO_MATCH  = (0, 0, 255)    # red    — no match
+# BGR colours (OpenCV uses BGR, not RGB)
+COLOR_MATCH    = (0, 220, 0)    # green
+COLOR_NO_MATCH = (0, 0, 220)    # red
 
 
 # ── Whitelist loading ─────────────────────────────────────────────────────────
 def load_whitelist(directory: str) -> dict:
-    """Load all reference images from `directory` and return
-    {name: [encoding, ...]} for each known person."""
+    """
+    Scan `directory` for images, extract a face embedding from each, and return
+    {name: [embedding, ...]} ready for comparison.
+
+    Flat layout   → filename stem becomes the name  (alice.jpg → "alice")
+    Subdirectory  → parent folder name becomes the name  (alice/front.jpg → "alice")
+    """
     db = defaultdict(list)
     root = Path(directory)
 
     if not root.exists():
-        print(f"[WARN] Whitelist directory '{directory}' not found — creating it.")
         root.mkdir(parents=True)
+        print(f"[INFO] Created '{directory}/' — add face images and restart.")
         return {}
 
+    supported = {".jpg", ".jpeg", ".png", ".bmp"}
+    found_any = False
+
     for path in sorted(root.rglob("*")):
-        if path.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+        if path.suffix.lower() not in supported:
+            continue
+        found_any = True
+
+        # Derive display name from path structure
+        name = path.parent.name if path.parent != root else path.stem
+
+        try:
+            results = DeepFace.represent(
+                img_path=str(path),
+                model_name=MODEL_NAME,
+                detector_backend=DETECTOR_BACKEND,
+                enforce_detection=True,
+                align=True,
+            )
+        except Exception as exc:
+            print(f"[WARN] Could not process '{path.name}': {exc}")
             continue
 
-        # Determine display name from path
-        if path.parent == root:
-            name = path.stem          # flat: whitelist/alice.jpg → "alice"
-        else:
-            name = path.parent.name   # subdir: whitelist/alice/photo.jpg → "alice"
-
-        image = face_recognition.load_image_file(str(path))
-        encodings = face_recognition.face_encodings(image)
-        if not encodings:
-            print(f"[WARN] No face detected in '{path}' — skipping.")
+        if not results:
+            print(f"[WARN] No face found in '{path.name}' — skipping.")
             continue
-        db[name].append(encodings[0])
-        print(f"  Loaded: {name} ({path.name})")
+        if len(results) > 1:
+            print(f"[WARN] Multiple faces in '{path.name}' — using the first one only.")
+
+        db[name].append(results[0]["embedding"])
+        print(f"  [OK] {name}  ({path.name})")
+
+    if not found_any:
+        print(f"[INFO] '{directory}/' is empty — all faces will show 'No Match'.")
 
     return dict(db)
 
 
-# ── Face matching ─────────────────────────────────────────────────────────────
-def match_face(encoding: np.ndarray, whitelist_db: dict) -> tuple:
-    """Compare `encoding` against all whitelist entries.
-    Returns (best_name, best_score) where score is in [0.0, 1.0]."""
-    best_name  = None
-    best_score = 0.0
+# ── Similarity ────────────────────────────────────────────────────────────────
+def cosine_similarity_pct(vec_a: list, vec_b: list) -> float:
+    """Cosine similarity between two embedding vectors, expressed as a percentage."""
+    a = np.asarray(vec_a, dtype=np.float64)
+    b = np.asarray(vec_b, dtype=np.float64)
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a, b) / denom) * 100.0
 
-    for name, known_encodings in whitelist_db.items():
-        distances = face_recognition.face_distance(known_encodings, encoding)
-        min_dist  = float(np.min(distances))
-        score     = max(0.0, 1.0 - (min_dist / DISTANCE_SCALE))
+
+def find_match(embedding: list, db: dict) -> tuple:
+    """
+    Compare `embedding` against every entry in the whitelist db.
+    Returns (best_name, best_score_pct, is_matched).
+    """
+    if not db:
+        return None, 0.0, False
+
+    best_name, best_score = None, 0.0
+    for name, embeddings in db.items():
+        score = max(cosine_similarity_pct(embedding, e) for e in embeddings)
         if score > best_score:
-            best_score = score
-            best_name  = name
+            best_score, best_name = score, name
 
-    return best_name, best_score
-
-
-# ── AWS Rekognition (optional) ────────────────────────────────────────────────
-def init_rekognition():
-    """Try to initialise a boto3 Rekognition client.
-    Returns the client or None if boto3/credentials are unavailable."""
-    try:
-        import boto3
-        client = boto3.client("rekognition")
-        # Lightweight test to verify credentials are present
-        client.list_collections(MaxResults=1)
-        print("[INFO] AWS Rekognition enabled.")
-        return client
-    except Exception as exc:
-        print(f"[INFO] AWS Rekognition not available ({exc}) — celebrity lookup disabled.")
-        return None
-
-
-def query_rekognition(client, frame_bgr: np.ndarray) -> list:
-    """Send `frame_bgr` to RecognizeCelebrities.
-    Returns a list of dicts with keys: name, confidence, bbox (top,right,bottom,left)."""
-    _, buf     = cv2.imencode(".jpg", frame_bgr)
-    response   = client.recognize_celebrities(Image={"Bytes": buf.tobytes()})
-    results    = []
-    h, w       = frame_bgr.shape[:2]
-
-    for celeb in response.get("CelebrityFaces", []):
-        bb   = celeb["Face"]["BoundingBox"]
-        conf = celeb["MatchConfidence"] / 100.0   # AWS returns 0–100
-        results.append({
-            "name":       celeb["Name"],
-            "confidence": conf,
-            "bbox": (
-                int(bb["Top"]    * h),
-                int((bb["Left"] + bb["Width"])  * w),
-                int((bb["Top"]  + bb["Height"]) * h),
-                int(bb["Left"]  * w),
-            ),
-        })
-    return results
-
-
-def snap(value: int) -> int:
-    """Round value to nearest CACHE_SNAP for stable cache keys despite minor movement."""
-    return round(value / CACHE_SNAP) * CACHE_SNAP
+    return best_name, best_score, best_score >= SIMILARITY_THRESHOLD
 
 
 # ── Drawing ───────────────────────────────────────────────────────────────────
-def draw_result(frame, top: int, right: int, bottom: int, left: int,
+def draw_result(frame, x: int, y: int, w: int, h: int,
                 label: str, color: tuple) -> None:
-    """Draw a colored bounding box with a filled label banner above it."""
-    # Box border
-    cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+    """Draw a coloured bounding box with a filled label banner below it."""
+    # Bounding box
+    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
 
-    # Label background (filled rectangle above the box)
-    label_h = 26
-    cv2.rectangle(frame, (left, top - label_h), (right, top), color, cv2.FILLED)
+    # Measure text so the banner fits perfectly
+    font, scale, thickness = cv2.FONT_HERSHEY_DUPLEX, 0.6, 1
+    (text_w, text_h), baseline = cv2.getTextSize(label, font, scale, thickness)
 
-    # White label text
-    cv2.putText(
-        frame, label,
-        (left + 4, top - 7),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1,
-        cv2.LINE_AA,
-    )
+    banner_x1 = x
+    banner_y1 = y + h + 1
+    banner_x2 = x + text_w + 10
+    banner_y2 = y + h + text_h + baseline + 12
+
+    cv2.rectangle(frame, (banner_x1, banner_y1), (banner_x2, banner_y2),
+                  color, cv2.FILLED)
+    cv2.putText(frame, label,
+                (banner_x1 + 5, banner_y2 - baseline - 3),
+                font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main loop ─────────────────────────────────────────────────────────────────
 def main():
-    print("=" * 50)
+    print("=" * 52)
     print("  Face Detection & Recognition App")
-    print("=" * 50)
+    print("=" * 52)
+    print(f"\n  Model      : {MODEL_NAME}")
+    print(f"  Threshold  : {SIMILARITY_THRESHOLD}%")
+    print(f"\nLoading whitelist — this may take a moment on first run...")
 
-    # Load whitelist
-    print(f"\nLoading whitelist from '{WHITELIST_DIR}/' ...")
-    whitelist_db = load_whitelist(WHITELIST_DIR)
-    if whitelist_db:
-        print(f"Loaded {len(whitelist_db)} person(s): {', '.join(whitelist_db)}")
-    else:
-        print("Whitelist is empty — all faces will show 'No Match' unless recognised as celebrities.")
+    db = load_whitelist(WHITELIST_DIR)
+    names = ", ".join(db) if db else "none"
+    print(f"\n  Whitelist  : {len(db)} person(s) — {names}")
 
-    # Init Rekognition (optional)
-    rek_client             = init_rekognition()
-    last_rek_time          = 0.0
-    celebrity_cache: dict  = {}   # (snap_top, snap_right, snap_bottom, snap_left) → {name, confidence}
-
-    # Open webcam
-    print("\nOpening camera (index 0) ...")
+    # Open webcam (index 0 = default camera; change to 1, 2, … if needed)
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        raise RuntimeError("Cannot open camera at index 0. Check that a webcam is connected.")
-    print("Camera open. Press 'q' to quit.\n")
+        print("\n[ERROR] Cannot open camera. Make sure a webcam is connected.")
+        return
 
-    scale_inv = int(1 / SCALE_FACTOR)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    # Haar cascade for fast face detection (included with opencv-python)
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+
+    # Cache the latest recognition results so every displayed frame shows labels
+    # even when recognition is skipped (runs every PROCESS_EVERY_N frames).
+    cached: list = []   # [(x, y, w, h, label, color), ...]
+    frame_n = 0
+
+    print("\nPress 'q' to quit.\n")
 
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("[WARN] Failed to capture frame — retrying ...")
+            print("[WARN] Failed to read frame — retrying...")
             continue
 
-        # ── Detection on downscaled frame ──
-        small     = cv2.resize(frame, (0, 0), fx=SCALE_FACTOR, fy=SCALE_FACTOR)
-        rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        frame_n += 1
 
-        locations = face_recognition.face_locations(rgb_small, model="hog")
-        encodings = face_recognition.face_encodings(rgb_small, locations)
+        if frame_n % PROCESS_EVERY_N == 0:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=MIN_FACE_SIZE,
+            )
 
-        # ── Optional: refresh Rekognition cache ──
-        now = time.monotonic()
-        if rek_client and (now - last_rek_time) >= REKOGNITION_COOLDOWN:
-            try:
-                rek_results    = query_rekognition(rek_client, frame)
-                last_rek_time  = now
-                celebrity_cache = {}
-                for r in rek_results:
-                    t, ri, b, l = r["bbox"]
-                    key = (snap(t), snap(ri), snap(b), snap(l))
-                    celebrity_cache[key] = {"name": r["name"], "confidence": r["confidence"]}
-            except Exception as exc:
-                print(f"[WARN] Rekognition error: {exc}")
+            cached = []
+            for (x, y, w, h) in faces:
+                crop = frame[y: y + h, x: x + w]
+                label, color = "No Match", COLOR_NO_MATCH
 
-        # ── Per-face decision & drawing ──
-        for (top, right, bottom, left), enc in zip(locations, encodings):
-            # Scale coords back to original resolution
-            top    *= scale_inv
-            right  *= scale_inv
-            bottom *= scale_inv
-            left   *= scale_inv
+                try:
+                    # Use detector_backend="skip" because we already cropped the face
+                    res = DeepFace.represent(
+                        img_path=crop,
+                        model_name=MODEL_NAME,
+                        detector_backend="skip",
+                        enforce_detection=False,
+                        align=False,
+                    )
+                    if res:
+                        name, score, matched = find_match(res[0]["embedding"], db)
+                        if matched:
+                            label = f"{name}  {score:.1f}%"
+                            color = COLOR_MATCH
+                except Exception:
+                    pass  # keep "No Match" on any error
 
-            name, score = match_face(enc, whitelist_db)
+                cached.append((x, y, w, h, label, color))
 
-            if score >= SIMILARITY_THRESHOLD:
-                # ── Whitelist match ──
-                label = f"{name}  {score:.0%}"
-                color = COLOR_MATCH
+        # Draw cached results on every frame (smooth visuals)
+        for (x, y, w, h, label, color) in cached:
+            draw_result(frame, x, y, w, h, label, color)
 
-            else:
-                # ── Try celebrity cache ──
-                cache_key    = (snap(top), snap(right), snap(bottom), snap(left))
-                celeb_entry  = celebrity_cache.get(cache_key)
+        # HUD
+        cv2.putText(
+            frame,
+            f"People in whitelist: {len(db)}   |   Q to quit",
+            (8, 24),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1,
+        )
 
-                # Also check nearby snapped keys (face may drift a little)
-                if celeb_entry is None:
-                    for key, val in celebrity_cache.items():
-                        kt, kr, kb, kl = key
-                        if (abs(kt - snap(top))    <= CACHE_SNAP * 2 and
-                                abs(kr - snap(right))  <= CACHE_SNAP * 2 and
-                                abs(kb - snap(bottom)) <= CACHE_SNAP * 2 and
-                                abs(kl - snap(left))   <= CACHE_SNAP * 2):
-                            celeb_entry = val
-                            break
+        cv2.imshow("Face Recognition", frame)
 
-                if celeb_entry and celeb_entry["confidence"] >= CELEBRITY_THRESHOLD:
-                    label = f"\u2605 {celeb_entry['name']}  {celeb_entry['confidence']:.0%}"
-                    color = COLOR_CELEBRITY
-                else:
-                    label = "No Match"
-                    color = COLOR_NO_MATCH
-
-            draw_result(frame, top, right, bottom, left, label, color)
-
-        cv2.imshow("Face Recognition  |  q = quit", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 

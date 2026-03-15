@@ -1,4 +1,5 @@
-face_recognition==1.3.0
-opencv-python==4.10.0.84
-numpy>=1.24,<2.0
-boto3>=1.34
+# Windows-compatible — no cmake or build tools required
+deepface>=0.0.93
+opencv-python>=4.8.0
+numpy>=1.24.0,<2.0
+tf-keras>=2.16.0
